@@ -508,16 +508,20 @@ class TarKGLoader:
         """Load selected TarKG CSV files with Polars.
 
         Args:
-            download: Whether to download missing files before loading. Set this
-                to ``False`` to read only from the current cache.
+            download: Whether to download missing CSV files before loading. When
+                ``use_parquet_cache=True`` and all selected parquet files already
+                exist, CSV files are not required and no download is attempted.
+                Set this to ``False`` to read only from existing parquet or CSV
+                cache files.
             kg: KG-level file selector.
             entities: Entity-information file selector.
             relations: Relation/edge file selector.
             features: Entity-feature file selector.
             lazy: Whether to return ``polars.LazyFrame`` objects instead of
                 eager ``polars.DataFrame`` objects.
-            use_parquet_cache: Whether to materialize and load parquet cache
-                files derived from the downloaded CSVs.
+            use_parquet_cache: Whether to prefer parquet cache files. Existing
+                parquet files can be loaded even when the source CSV files are
+                unavailable.
             read_csv_kwargs: Optional keyword arguments forwarded to
                 ``polars.read_csv`` when ``lazy=False`` and parquet caching is
                 disabled.
@@ -536,19 +540,62 @@ class TarKGLoader:
 
         Raises:
             ImportError: If Polars is not installed.
-            FileNotFoundError: If ``download=False`` and any selected CSV file is
-                missing from the cache.
+            FileNotFoundError: If ``download=False`` and any selected parquet or
+                CSV file is missing from the cache.
         """
 
-        if download:
-            self.download(
+        if use_parquet_cache:
+            if self._all_selected_parquet_cached(
                 kg=kg,
                 entities=entities,
                 relations=relations,
                 features=features,
-            )
+            ):
+                if lazy:
+                    return self.scan_parquet(
+                        kg=kg,
+                        entities=entities,
+                        relations=relations,
+                        features=features,
+                        scan_parquet_kwargs=scan_parquet_kwargs,
+                    )
+                return self.load_parquet(
+                    kg=kg,
+                    entities=entities,
+                    relations=relations,
+                    features=features,
+                    read_parquet_kwargs=read_parquet_kwargs,
+                )
 
-        if use_parquet_cache:
+            if not download and not self._all_selected_csv_cached(
+                kg=kg,
+                entities=entities,
+                relations=relations,
+                features=features,
+            ):
+                if lazy:
+                    return self.scan_parquet(
+                        kg=kg,
+                        entities=entities,
+                        relations=relations,
+                        features=features,
+                        scan_parquet_kwargs=scan_parquet_kwargs,
+                    )
+                return self.load_parquet(
+                    kg=kg,
+                    entities=entities,
+                    relations=relations,
+                    features=features,
+                    read_parquet_kwargs=read_parquet_kwargs,
+                )
+
+            if download:
+                self.download(
+                    kg=kg,
+                    entities=entities,
+                    relations=relations,
+                    features=features,
+                )
             self.materialize_parquet_cache(
                 kg=kg,
                 entities=entities,
@@ -570,6 +617,14 @@ class TarKGLoader:
                 relations=relations,
                 features=features,
                 read_parquet_kwargs=read_parquet_kwargs,
+            )
+
+        if download:
+            self.download(
+                kg=kg,
+                entities=entities,
+                relations=relations,
+                features=features,
             )
 
         if lazy:
@@ -1030,6 +1085,85 @@ class TarKGLoader:
             )
             if file.name.endswith(".csv")
         ]
+
+    def _all_selected_parquet_cached(
+        self,
+        *,
+        kg: Selector,
+        entities: Selector,
+        relations: Selector,
+        features: Selector,
+    ) -> bool:
+        """Return whether all selected CSV-backed files have parquet caches.
+
+        This check intentionally allows restored parquet-only caches to be
+        loaded without source CSV files or metadata. When a source CSV is also
+        present, metadata is checked so stale parquet caches are regenerated.
+
+        Args:
+            kg: KG-level file selector.
+            entities: Entity-information file selector.
+            relations: Relation/edge file selector.
+            features: Entity-feature file selector.
+
+        Returns:
+            ``True`` when every selected CSV manifest entry has an existing and
+            usable parquet file. Returns ``False`` when at least one selected
+            parquet file is missing or stale relative to an available CSV.
+        """
+
+        selected_files = self._selected_csv_files(
+            kg=kg,
+            entities=entities,
+            relations=relations,
+            features=features,
+        )
+        for file in selected_files:
+            parquet_path = self._parquet_path(file)
+            if not parquet_path.exists():
+                return False
+
+            csv_path = self.cache_dir / file.name
+            if not csv_path.exists():
+                continue
+
+            metadata_path = self._parquet_metadata_path(file)
+            metadata = self._parquet_metadata(file, csv_path)
+            if not self._is_valid_parquet_cache(parquet_path, metadata_path, metadata):
+                return False
+
+        return True
+
+    def _all_selected_csv_cached(
+        self,
+        *,
+        kg: Selector,
+        entities: Selector,
+        relations: Selector,
+        features: Selector,
+    ) -> bool:
+        """Return whether all selected CSV-backed files are cached locally.
+
+        Args:
+            kg: KG-level file selector.
+            entities: Entity-information file selector.
+            relations: Relation/edge file selector.
+            features: Entity-feature file selector.
+
+        Returns:
+            ``True`` when every selected CSV manifest entry exists in
+            ``self.cache_dir``.
+        """
+
+        return all(
+            (self.cache_dir / file.name).exists()
+            for file in self._selected_csv_files(
+                kg=kg,
+                entities=entities,
+                relations=relations,
+                features=features,
+            )
+        )
 
     def _cached_csv_path(self, file: TarKGFile) -> Path:
         """Return an existing cached CSV path for a manifest entry.
@@ -1780,7 +1914,9 @@ def load_tarkg(
         cache_dir: Directory where downloaded files are cached.
         parquet_cache_dir: Directory where CSV-to-parquet cache files are
             stored. Defaults to ``cache_dir / "parquet"``.
-        download: Whether to download missing files before loading.
+        download: Whether to download missing CSV files before loading. When
+            ``use_parquet_cache=True`` and all selected parquet files already
+            exist, CSV files are not required and no download is attempted.
         max_workers: Maximum number of files to download concurrently.
         kg: KG-level file selector.
         entities: Entity-information file selector.
@@ -1793,8 +1929,9 @@ def load_tarkg(
             hashes after download or cache reuse.
         lazy: Whether to return ``polars.LazyFrame`` objects instead of eager
             ``polars.DataFrame`` objects.
-        use_parquet_cache: Whether to materialize and load parquet cache files
-            derived from the downloaded CSVs.
+        use_parquet_cache: Whether to prefer parquet cache files. Existing
+            parquet files can be loaded even when the source CSV files are
+            unavailable.
         read_csv_kwargs: Optional keyword arguments forwarded to
             ``polars.read_csv`` or ``polars.scan_csv`` during parquet
             materialization.
