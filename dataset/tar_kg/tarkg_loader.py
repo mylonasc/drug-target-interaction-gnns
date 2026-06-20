@@ -1293,8 +1293,8 @@ class TarKGLoader:
                 when several files download in parallel.
         """
 
-        use_notebook_progress = self.show_progress and self._is_notebook()
-        tqdm = None if use_notebook_progress else self._tqdm()
+        use_html_progress = self.show_progress and self._should_use_html_progress()
+        tqdm = None if use_html_progress else self._tqdm()
 
         downloaded = initial
         with destination.open(mode) as output:
@@ -1314,7 +1314,7 @@ class TarKGLoader:
                         bar.update(len(chunk))
                 return
 
-            if use_notebook_progress:
+            if use_html_progress:
                 self._update_notebook_progress(
                     label,
                     downloaded,
@@ -1351,10 +1351,14 @@ class TarKGLoader:
         """Return the best available tqdm progress-bar implementation.
 
         Returns:
-            ``tqdm.tqdm`` when tqdm is installed, otherwise ``None``. Notebook
-            progress uses a custom HTML display to avoid ANSI escape-code spam
-            when Jupyter widget support is unavailable.
+            ``tqdm.tqdm`` when tqdm is installed and stderr is an interactive
+            terminal, otherwise ``None``. Notebook progress uses a custom HTML
+            display to avoid repeated-line output in Colab, VS Code notebooks,
+            and Jupyter frontends without widget support.
         """
+
+        if not sys.stderr.isatty():
+            return None
 
         try:
             from tqdm import tqdm
@@ -1362,11 +1366,34 @@ class TarKGLoader:
             return None
         return tqdm
 
-    def _is_notebook(self) -> bool:
-        """Return whether the loader is running inside a Jupyter notebook.
+    def _should_use_html_progress(self) -> bool:
+        """Return whether progress should use the HTML notebook renderer.
 
         Returns:
-            ``True`` when the active IPython shell is a Jupyter kernel.
+            ``True`` for Google Colab, VS Code notebooks, and Jupyter kernels.
+            Terminal ``tqdm`` is intentionally avoided in those environments
+            because ANSI cursor-control updates are often rendered as repeated
+            output lines.
+        """
+
+        return self._is_colab() or self._is_notebook()
+
+    def _is_colab(self) -> bool:
+        """Return whether the loader is running inside Google Colab.
+
+        Returns:
+            ``True`` when Colab-specific modules or environment variables are
+            present.
+        """
+
+        return "google.colab" in sys.modules or "COLAB_RELEASE_TAG" in os.environ
+
+    def _is_notebook(self) -> bool:
+        """Return whether the loader is running inside a notebook frontend.
+
+        Returns:
+            ``True`` when the active IPython shell is a Jupyter-like kernel,
+            including VS Code notebooks and many hosted notebook frontends.
         """
 
         try:
@@ -1377,7 +1404,12 @@ class TarKGLoader:
         shell = get_ipython()
         if shell is None:
             return False
-        return shell.__class__.__name__ == "ZMQInteractiveShell"
+        shell_name = shell.__class__.__name__
+        if shell_name == "ZMQInteractiveShell":
+            return True
+        if shell_name == "TerminalInteractiveShell":
+            return False
+        return hasattr(shell, "kernel") or "VSCODE_PID" in os.environ
 
     def _update_notebook_progress(
         self,
@@ -1416,10 +1448,16 @@ class TarKGLoader:
             except ImportError:
                 return
 
-            if self._progress_display is None:
-                self._progress_display = display(HTML(rendered), display_id=True)
-            else:
-                self._progress_display.update(HTML(rendered))
+            try:
+                if self._progress_display is None:
+                    self._progress_display = display(HTML(rendered), display_id=True)
+                else:
+                    self._progress_display.update(HTML(rendered))
+            except Exception:
+                # Some hosted notebook frontends reject display updates from
+                # worker threads. Avoid falling back to terminal tqdm, which
+                # corrupts notebook output with ANSI cursor-control codes.
+                return
 
     def _render_notebook_progress(self) -> str:
         """Build the notebook HTML progress table.
