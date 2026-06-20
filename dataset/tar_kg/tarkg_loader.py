@@ -5,12 +5,35 @@ https://tarkg.ddtmlab.org/download
 
 The downloader caches files under ``~/.datasets/tarkg_data`` by default and
 skips files that are already present unless ``force=True`` is used.
+
+The core KG files are ``TarKG_nodes.csv`` and ``TarKG_edges.csv``. The
+``*_mapping.csv`` files map TarKG node and edge records back to the original
+source knowledge graphs and source identifiers they were integrated from.
+Entity-information files, such as ``Gene_nodes.csv``, contain detailed records
+for one entity type. Feature files, such as ``Gene_feature.csv``, contain model
+features for supported entity types.
+
+Example:
+    Load only genes and the unique edge table as lazy Polars frames, using the
+    parquet cache when available::
+
+        from dataset.tar_kg.tarkg_loader import TarKGEntity, TarKGLoader, TarKGRelation
+
+        loader = TarKGLoader()
+        data = loader.load(
+            kg=False,
+            entities=[TarKGEntity.GENE],
+            relations=[TarKGRelation.EDGES],
+            features=False,
+            lazy=True,
+        )
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Iterable, Literal
 from urllib.error import HTTPError
@@ -18,6 +41,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 import html
 import hashlib
+import json
 import os
 import ssl
 import sys
@@ -27,10 +51,39 @@ import time
 
 BASE_URL = "https://tarkg.ddtmlab.org"
 DEFAULT_CACHE_DIR = Path("~/.datasets/tarkg_data").expanduser()
+DEFAULT_PARQUET_CACHE_DIR = DEFAULT_CACHE_DIR / "parquet"
 CHUNK_SIZE = 1024 * 1024
+PARQUET_CACHE_VERSION = 1
 
 Category = Literal["kg", "entity", "relation", "feature"]
-Selector = bool | str | Iterable[str]
+SelectorValue = str | StrEnum
+Selector = bool | SelectorValue | Iterable[SelectorValue]
+
+
+class TarKGEntity(StrEnum):
+    """Valid TarKG entity names for entity-information and feature selectors."""
+
+    COMPOUND = "Compound"
+    GENE = "Gene"
+    DISEASE = "Disease"
+    PATHWAY = "Pathway"
+    GO = "Go"
+    ANATOMY = "Anatomy"
+    PHENOTYPE = "Phenotype"
+    SIDE_EFFECT = "Side_Effect"
+    TCM_CMM = "TCM_CMM"
+    TCM_PRESCRIPTION = "TCM_Prescription"
+    TCM_SYMPTOM = "TCM_Symptom"
+    SYMPTOM = "Symptom"
+    TCM_SYNDROME = "TCM_Syndrome"
+    DRUG = "Drug"
+
+
+class TarKGRelation(StrEnum):
+    """Valid TarKG relation-file selectors."""
+
+    EDGES = "edges"
+    EDGES_MAPPING = "edges_mapping"
 
 
 @dataclass(frozen=True)
@@ -245,18 +298,37 @@ class TarKGLoader:
     The loader knows the file manifest published at
     ``https://tarkg.ddtmlab.org/download`` and provides a single interface for
     selecting dataset subsets, downloading them in parallel, resuming partial
-    downloads, reusing cached files, and reading cached CSV files into pandas
-    DataFrames. Files are cached under ``~/.datasets/tarkg_data`` by default,
-    but the cache directory, download parallelism, progress reporting, and
-    integrity checking behavior are configurable at construction time. HTTPS
+    downloads, reusing cached files, converting CSV files to parquet, and reading
+    cached data with Polars. Files are cached under ``~/.datasets/tarkg_data`` by
+    default, but the cache directory, download parallelism, progress reporting,
+    and integrity checking behavior are configurable at construction time. HTTPS
     certificate validation is disabled by default because the TarKG host
     currently serves an expired TLS certificate.
+
+    Mapping files clarify provenance: ``TarKG_nodes_mapping.csv`` maps TarKG
+    nodes to their original source-KG identifiers, while
+    ``TarKG_edges_mapping.csv`` maps TarKG edges to the original source-KG edge
+    records they refer to.
+
+    Example:
+        Load only gene entity information plus the unique edge table as lazy
+        Polars frames::
+
+            loader = TarKGLoader()
+            data = loader.load(
+                kg=False,
+                entities=[TarKGEntity.GENE],
+                relations=[TarKGRelation.EDGES],
+                features=False,
+                lazy=True,
+            )
     """
 
     def __init__(
         self,
         cache_dir: str | os.PathLike[str] = DEFAULT_CACHE_DIR,
         *,
+        parquet_cache_dir: str | os.PathLike[str] | None = None,
         max_workers: int = 4,
         verify_ssl: bool = False,
         show_progress: bool = True,
@@ -266,6 +338,8 @@ class TarKGLoader:
 
         Args:
             cache_dir: Directory where downloaded TarKG files are cached.
+            parquet_cache_dir: Directory where CSV-to-parquet cache files are
+                stored. Defaults to ``cache_dir / "parquet"``.
             max_workers: Maximum number of files to download concurrently.
             verify_ssl: Whether to verify HTTPS certificates. The TarKG host has
                 previously served an expired certificate, so this defaults to
@@ -277,6 +351,11 @@ class TarKGLoader:
         """
 
         self.cache_dir = Path(cache_dir).expanduser()
+        self.parquet_cache_dir = (
+            Path(parquet_cache_dir).expanduser()
+            if parquet_cache_dir is not None
+            else self.cache_dir / "parquet"
+        )
         self.max_workers = max(1, max_workers)
         self.verify_ssl = verify_ssl
         self.show_progress = show_progress
@@ -322,14 +401,19 @@ class TarKGLoader:
                 ``False`` selects none, and strings or iterables select by file
                 name, stem, or prefix.
             entities: Entity-information file selector. Examples include
-                ``"Gene"`` or ``["Compound", "Disease"]``.
+                ``TarKGEntity.GENE``, ``"Gene"``, or
+                ``[TarKGEntity.COMPOUND, TarKGEntity.DISEASE]``.
             relations: Relation/edge file selector. Examples include
-                ``"edges"`` or ``"edges_mapping"``.
+                ``TarKGRelation.EDGES``, ``"edges"``, or ``"edges_mapping"``.
             features: Entity-feature file selector. Examples include
-                ``"Drug"`` or ``["Gene_feature.csv"]``.
+                ``TarKGEntity.DRUG``, ``"Drug"``, or ``["Gene_feature.csv"]``.
 
         Returns:
             A list of manifest entries matching the requested selectors.
+
+        Raises:
+            ValueError: If a selector value does not match any valid file for its
+                category. The error includes valid examples.
         """
 
         selected: list[TarKGFile] = []
@@ -339,6 +423,9 @@ class TarKGLoader:
             "relation": relations,
             "feature": features,
         }
+
+        for category, selector in selectors.items():
+            self._validate_selector(category, selector)
 
         for file in FILES:
             selector = selectors[file.category]
@@ -411,9 +498,14 @@ class TarKGLoader:
         entities: Selector = True,
         relations: Selector = True,
         features: Selector = True,
+        lazy: bool = False,
+        use_parquet_cache: bool = True,
         read_csv_kwargs: dict | None = None,
+        scan_csv_kwargs: dict | None = None,
+        read_parquet_kwargs: dict | None = None,
+        scan_parquet_kwargs: dict | None = None,
     ):
-        """Load selected TarKG CSV files as pandas DataFrames.
+        """Load selected TarKG CSV files with Polars.
 
         Args:
             download: Whether to download missing files before loading. Set this
@@ -422,33 +514,31 @@ class TarKGLoader:
             entities: Entity-information file selector.
             relations: Relation/edge file selector.
             features: Entity-feature file selector.
+            lazy: Whether to return ``polars.LazyFrame`` objects instead of
+                eager ``polars.DataFrame`` objects.
+            use_parquet_cache: Whether to materialize and load parquet cache
+                files derived from the downloaded CSVs.
             read_csv_kwargs: Optional keyword arguments forwarded to
-                ``pandas.read_csv``.
+                ``polars.read_csv`` when ``lazy=False`` and parquet caching is
+                disabled.
+            scan_csv_kwargs: Optional keyword arguments forwarded to
+                ``polars.scan_csv`` when ``lazy=True`` and parquet caching is
+                disabled.
+            read_parquet_kwargs: Optional keyword arguments forwarded to
+                ``polars.read_parquet`` when loading eager parquet data.
+            scan_parquet_kwargs: Optional keyword arguments forwarded to
+                ``polars.scan_parquet`` when loading lazy parquet data.
 
         Returns:
-            A dictionary mapping CSV stems, such as ``"Gene_nodes"``, to pandas
-            DataFrames. Non-CSV files such as ``README.md`` are skipped.
+            A dictionary mapping CSV stems, such as ``"Gene_nodes"``, to Polars
+            DataFrames or LazyFrames. Non-CSV files such as ``README.md`` are
+            skipped.
 
         Raises:
-            ImportError: If pandas is not installed.
+            ImportError: If Polars is not installed.
             FileNotFoundError: If ``download=False`` and any selected CSV file is
                 missing from the cache.
         """
-
-        try:
-            import pandas as pd
-        except ImportError as exc:
-            raise ImportError(
-                "TarKGLoader.load requires pandas. Use TarKGLoader.download "
-                "for download-only usage."
-            ) from exc
-
-        files = self.select_files(
-            kg=kg,
-            entities=entities,
-            relations=relations,
-            features=features,
-        )
 
         if download:
             self.download(
@@ -458,23 +548,45 @@ class TarKGLoader:
                 features=features,
             )
 
-        kwargs = read_csv_kwargs or {}
-        data = {}
-        missing = []
-        for file in files:
-            if not file.name.endswith(".csv"):
-                continue
-            path = self.cache_dir / file.name
-            if path.exists():
-                data[file.stem] = pd.read_csv(path, **kwargs)
-            else:
-                missing.append(path)
+        if use_parquet_cache:
+            self.materialize_parquet_cache(
+                kg=kg,
+                entities=entities,
+                relations=relations,
+                features=features,
+                read_csv_kwargs=read_csv_kwargs,
+            )
+            if lazy:
+                return self.scan_parquet(
+                    kg=kg,
+                    entities=entities,
+                    relations=relations,
+                    features=features,
+                    scan_parquet_kwargs=scan_parquet_kwargs,
+                )
+            return self.load_parquet(
+                kg=kg,
+                entities=entities,
+                relations=relations,
+                features=features,
+                read_parquet_kwargs=read_parquet_kwargs,
+            )
 
-        if missing:
-            missing_paths = ", ".join(str(path) for path in missing)
-            raise FileNotFoundError(f"Cached TarKG files not found: {missing_paths}")
-
-        return data
+        if lazy:
+            return self.scan_csv(
+                kg=kg,
+                entities=entities,
+                relations=relations,
+                features=features,
+                scan_csv_kwargs=scan_csv_kwargs,
+            )
+        return self.load_csv(
+            kg=kg,
+            entities=entities,
+            relations=relations,
+            features=features,
+            read_csv_kwargs=read_csv_kwargs,
+        )
 
     def cached_paths(
         self,
@@ -510,6 +622,259 @@ class TarKGLoader:
         if only_existing:
             paths = {name: path for name, path in paths.items() if path.exists()}
         return paths
+
+    def parquet_paths(
+        self,
+        *,
+        kg: Selector = True,
+        entities: Selector = True,
+        relations: Selector = True,
+        features: Selector = True,
+        only_existing: bool = True,
+    ) -> dict[str, Path]:
+        """Return parquet cache paths for selected TarKG CSV files.
+
+        Args:
+            kg: KG-level file selector.
+            entities: Entity-information file selector.
+            relations: Relation/edge file selector.
+            features: Entity-feature file selector.
+            only_existing: Whether to omit parquet files not currently cached.
+
+        Returns:
+            A dictionary mapping CSV stems to parquet cache paths.
+        """
+
+        paths = {
+            file.stem: self._parquet_path(file)
+            for file in self._selected_csv_files(
+                kg=kg,
+                entities=entities,
+                relations=relations,
+                features=features,
+            )
+        }
+        if only_existing:
+            paths = {name: path for name, path in paths.items() if path.exists()}
+        return paths
+
+    def load_csv(
+        self,
+        *,
+        kg: Selector = True,
+        entities: Selector = True,
+        relations: Selector = True,
+        features: Selector = True,
+        read_csv_kwargs: dict | None = None,
+    ) -> dict[str, object]:
+        """Load selected cached CSV files as eager Polars DataFrames.
+
+        Args:
+            kg: KG-level file selector.
+            entities: Entity-information file selector.
+            relations: Relation/edge file selector.
+            features: Entity-feature file selector.
+            read_csv_kwargs: Optional keyword arguments forwarded to
+                ``polars.read_csv``.
+
+        Returns:
+            A dictionary mapping CSV stems to ``polars.DataFrame`` objects.
+
+        Raises:
+            ImportError: If Polars is not installed.
+            FileNotFoundError: If any selected CSV file is missing from cache.
+        """
+
+        pl = self._polars()
+        kwargs = read_csv_kwargs or {}
+        data = {}
+        for file in self._selected_csv_files(
+            kg=kg,
+            entities=entities,
+            relations=relations,
+            features=features,
+        ):
+            path = self._cached_csv_path(file)
+            data[file.stem] = pl.read_csv(path, **kwargs)
+        return data
+
+    def scan_csv(
+        self,
+        *,
+        kg: Selector = True,
+        entities: Selector = True,
+        relations: Selector = True,
+        features: Selector = True,
+        scan_csv_kwargs: dict | None = None,
+    ) -> dict[str, object]:
+        """Return lazy Polars scans for selected cached CSV files.
+
+        Args:
+            kg: KG-level file selector.
+            entities: Entity-information file selector.
+            relations: Relation/edge file selector.
+            features: Entity-feature file selector.
+            scan_csv_kwargs: Optional keyword arguments forwarded to
+                ``polars.scan_csv``.
+
+        Returns:
+            A dictionary mapping CSV stems to ``polars.LazyFrame`` objects.
+
+        Raises:
+            ImportError: If Polars is not installed.
+            FileNotFoundError: If any selected CSV file is missing from cache.
+        """
+
+        pl = self._polars()
+        kwargs = scan_csv_kwargs or {}
+        data = {}
+        for file in self._selected_csv_files(
+            kg=kg,
+            entities=entities,
+            relations=relations,
+            features=features,
+        ):
+            path = self._cached_csv_path(file)
+            data[file.stem] = pl.scan_csv(path, **kwargs)
+        return data
+
+    def materialize_parquet_cache(
+        self,
+        *,
+        kg: Selector = True,
+        entities: Selector = True,
+        relations: Selector = True,
+        features: Selector = True,
+        force: bool = False,
+        read_csv_kwargs: dict | None = None,
+    ) -> dict[str, Path]:
+        """Convert selected cached CSV files to parquet cache files.
+
+        Parquet files are regenerated only when absent, ``force=True``, or the
+        stored metadata no longer matches the source CSV size, modification time,
+        expected hash, or cache format version.
+
+        Args:
+            kg: KG-level file selector.
+            entities: Entity-information file selector.
+            relations: Relation/edge file selector.
+            features: Entity-feature file selector.
+            force: Whether to overwrite valid parquet cache files.
+            read_csv_kwargs: Optional keyword arguments forwarded to
+                ``polars.scan_csv`` before writing parquet.
+
+        Returns:
+            A dictionary mapping CSV stems to parquet cache paths.
+
+        Raises:
+            ImportError: If Polars is not installed.
+            FileNotFoundError: If any selected CSV file is missing from cache.
+        """
+
+        pl = self._polars()
+        kwargs = read_csv_kwargs or {}
+        self.parquet_cache_dir.mkdir(parents=True, exist_ok=True)
+        paths = {}
+        for file in self._selected_csv_files(
+            kg=kg,
+            entities=entities,
+            relations=relations,
+            features=features,
+        ):
+            csv_path = self._cached_csv_path(file)
+            parquet_path = self._parquet_path(file)
+            metadata_path = self._parquet_metadata_path(file)
+            metadata = self._parquet_metadata(file, csv_path)
+            if not force and self._is_valid_parquet_cache(parquet_path, metadata_path, metadata):
+                paths[file.stem] = parquet_path
+                continue
+
+            temp_path = parquet_path.with_suffix(parquet_path.suffix + ".part")
+            pl.scan_csv(csv_path, **kwargs).sink_parquet(temp_path)
+            temp_path.replace(parquet_path)
+            metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+            paths[file.stem] = parquet_path
+        return dict(sorted(paths.items()))
+
+    def load_parquet(
+        self,
+        *,
+        kg: Selector = True,
+        entities: Selector = True,
+        relations: Selector = True,
+        features: Selector = True,
+        read_parquet_kwargs: dict | None = None,
+    ) -> dict[str, object]:
+        """Load selected parquet cache files as eager Polars DataFrames.
+
+        Args:
+            kg: KG-level file selector.
+            entities: Entity-information file selector.
+            relations: Relation/edge file selector.
+            features: Entity-feature file selector.
+            read_parquet_kwargs: Optional keyword arguments forwarded to
+                ``polars.read_parquet``.
+
+        Returns:
+            A dictionary mapping CSV stems to ``polars.DataFrame`` objects.
+
+        Raises:
+            ImportError: If Polars is not installed.
+            FileNotFoundError: If any selected parquet cache file is missing.
+        """
+
+        pl = self._polars()
+        kwargs = read_parquet_kwargs or {}
+        data = {}
+        for file in self._selected_csv_files(
+            kg=kg,
+            entities=entities,
+            relations=relations,
+            features=features,
+        ):
+            parquet_path = self._existing_parquet_path(file)
+            data[file.stem] = pl.read_parquet(parquet_path, **kwargs)
+        return data
+
+    def scan_parquet(
+        self,
+        *,
+        kg: Selector = True,
+        entities: Selector = True,
+        relations: Selector = True,
+        features: Selector = True,
+        scan_parquet_kwargs: dict | None = None,
+    ) -> dict[str, object]:
+        """Return lazy Polars scans for selected parquet cache files.
+
+        Args:
+            kg: KG-level file selector.
+            entities: Entity-information file selector.
+            relations: Relation/edge file selector.
+            features: Entity-feature file selector.
+            scan_parquet_kwargs: Optional keyword arguments forwarded to
+                ``polars.scan_parquet``.
+
+        Returns:
+            A dictionary mapping CSV stems to ``polars.LazyFrame`` objects.
+
+        Raises:
+            ImportError: If Polars is not installed.
+            FileNotFoundError: If any selected parquet cache file is missing.
+        """
+
+        pl = self._polars()
+        kwargs = scan_parquet_kwargs or {}
+        data = {}
+        for file in self._selected_csv_files(
+            kg=kg,
+            entities=entities,
+            relations=relations,
+            features=features,
+        ):
+            parquet_path = self._existing_parquet_path(file)
+            data[file.stem] = pl.scan_parquet(parquet_path, **kwargs)
+        return data
 
     def sha256(self, path: str | os.PathLike[str]) -> str:
         """Compute the SHA256 digest for a local file.
@@ -615,6 +980,173 @@ class TarKGLoader:
             self._verify_sha256(file, path)
             verified[file.name] = path
         return verified
+
+    def _polars(self):
+        """Import Polars with a loader-specific error message.
+
+        Returns:
+            The imported ``polars`` module.
+
+        Raises:
+            ImportError: If Polars is not installed.
+        """
+
+        try:
+            import polars as pl
+        except ImportError as exc:
+            raise ImportError(
+                "TarKGLoader Polars loading requires polars. Install it with "
+                "`pip install polars`."
+            ) from exc
+        return pl
+
+    def _selected_csv_files(
+        self,
+        *,
+        kg: Selector,
+        entities: Selector,
+        relations: Selector,
+        features: Selector,
+    ) -> list[TarKGFile]:
+        """Return selected manifest entries that correspond to CSV files.
+
+        Args:
+            kg: KG-level file selector.
+            entities: Entity-information file selector.
+            relations: Relation/edge file selector.
+            features: Entity-feature file selector.
+
+        Returns:
+            A list of selected CSV manifest entries.
+        """
+
+        return [
+            file
+            for file in self.select_files(
+                kg=kg,
+                entities=entities,
+                relations=relations,
+                features=features,
+            )
+            if file.name.endswith(".csv")
+        ]
+
+    def _cached_csv_path(self, file: TarKGFile) -> Path:
+        """Return an existing cached CSV path for a manifest entry.
+
+        Args:
+            file: CSV manifest entry.
+
+        Returns:
+            Existing local CSV cache path.
+
+        Raises:
+            FileNotFoundError: If the CSV is missing from the cache.
+        """
+
+        path = self.cache_dir / file.name
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Cached TarKG CSV file not found: {path}. "
+                "Download it first, for example: "
+                "loader.download(kg=False, entities=[TarKGEntity.GENE], "
+                "relations=False, features=False), or call "
+                "loader.load(..., download=True)."
+            )
+        return path
+
+    def _parquet_path(self, file: TarKGFile) -> Path:
+        """Return the parquet cache path for a CSV manifest entry.
+
+        Args:
+            file: CSV manifest entry.
+
+        Returns:
+            Local parquet cache path.
+        """
+
+        return self.parquet_cache_dir / f"{file.stem}.parquet"
+
+    def _parquet_metadata_path(self, file: TarKGFile) -> Path:
+        """Return the metadata path for a parquet cache file.
+
+        Args:
+            file: CSV manifest entry.
+
+        Returns:
+            Local JSON metadata path.
+        """
+
+        return self.parquet_cache_dir / f"{file.stem}.parquet.meta.json"
+
+    def _existing_parquet_path(self, file: TarKGFile) -> Path:
+        """Return an existing parquet cache path for a manifest entry.
+
+        Args:
+            file: CSV manifest entry.
+
+        Returns:
+            Existing local parquet cache path.
+
+        Raises:
+            FileNotFoundError: If the parquet cache file is missing.
+        """
+
+        path = self._parquet_path(file)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"TarKG parquet cache file not found: {path}. "
+                "Create it first with loader.materialize_parquet_cache(...), "
+                "or call loader.load(..., use_parquet_cache=True). Example: "
+                "loader.materialize_parquet_cache(kg=False, "
+                "entities=[TarKGEntity.GENE], relations=False, features=False)."
+            )
+        return path
+
+    def _parquet_metadata(self, file: TarKGFile, csv_path: Path) -> dict[str, object]:
+        """Build parquet cache metadata for a source CSV file.
+
+        Args:
+            file: CSV manifest entry.
+            csv_path: Existing source CSV path.
+
+        Returns:
+            Metadata dictionary used to validate the parquet cache.
+        """
+
+        stat = csv_path.stat()
+        return {
+            "cache_version": PARQUET_CACHE_VERSION,
+            "source_name": file.name,
+            "source_size": stat.st_size,
+            "source_mtime_ns": stat.st_mtime_ns,
+            "source_sha256": SHA256_HASHES.get(file.name),
+        }
+
+    def _is_valid_parquet_cache(
+        self,
+        parquet_path: Path,
+        metadata_path: Path,
+        expected_metadata: dict[str, object],
+    ) -> bool:
+        """Return whether a parquet cache file matches expected metadata.
+
+        Args:
+            parquet_path: Parquet cache path.
+            metadata_path: JSON metadata path next to the parquet cache.
+            expected_metadata: Metadata expected for the current source CSV.
+
+        Returns:
+            ``True`` when the parquet file exists and metadata exactly matches.
+        """
+
+        if not parquet_path.exists() or not metadata_path.exists():
+            return False
+        try:
+            actual_metadata = json.loads(metadata_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        return actual_metadata == expected_metadata
 
     def _download_one(
         self,
@@ -933,6 +1465,113 @@ class TarKGLoader:
             + "</tbody></table>"
         )
 
+    def _validate_selector(self, category: Category, selector: Selector) -> None:
+        """Validate a selector against manifest aliases for one category.
+
+        Args:
+            category: Manifest category being selected.
+            selector: User-provided selector value.
+
+        Raises:
+            ValueError: If any selector item is invalid for the category.
+        """
+
+        if selector is True or selector is False or selector is None:
+            return
+
+        valid_aliases = self._valid_selector_aliases(category)
+        invalid = [
+            item
+            for item in self._selector_items(selector)
+            if self._normalize(item) not in valid_aliases
+        ]
+        if not invalid:
+            return
+
+        invalid_text = ", ".join(repr(str(item)) for item in invalid)
+        raise ValueError(
+            f"Invalid TarKG {category} selector(s): {invalid_text}. "
+            f"Valid examples: {self._valid_selector_examples(category)}. "
+            "Selectors may be True, False, a string, an enum value, or a list "
+            "of strings/enum values. For example: "
+            "entities=[TarKGEntity.GENE], relations=[TarKGRelation.EDGES], "
+            "features=[TarKGEntity.DRUG]."
+        )
+
+    def _valid_selector_aliases(self, category: Category) -> set[str]:
+        """Return normalized valid selector aliases for one category.
+
+        Args:
+            category: Manifest category.
+
+        Returns:
+            A set of normalized aliases accepted by selectors for the category.
+        """
+
+        aliases = set()
+        for file in FILES:
+            if file.category != category:
+                continue
+            aliases.update(self._file_aliases(file))
+        return aliases
+
+    def _valid_selector_examples(self, category: Category) -> str:
+        """Return a compact examples string for a selector category.
+
+        Args:
+            category: Manifest category.
+
+        Returns:
+            Human-readable valid selector examples.
+        """
+
+        examples = {
+            "kg": "'README', 'nodes', 'nodes_mapping', 'TarKG_nodes.csv'",
+            "entity": "TarKGEntity.GENE, 'Gene', 'Compound_nodes.csv'",
+            "relation": "TarKGRelation.EDGES, 'edges', 'edges_mapping'",
+            "feature": "TarKGEntity.DRUG, 'Drug', 'Gene_feature.csv'",
+        }
+        return examples[category]
+
+    def _selector_items(self, selector: Selector) -> list[SelectorValue]:
+        """Normalize a selector into a list of selector items.
+
+        Args:
+            selector: User-provided selector value.
+
+        Returns:
+            A list of string-like selector values.
+        """
+
+        if isinstance(selector, (str, StrEnum)):
+            return [selector]
+        try:
+            return list(selector)
+        except TypeError as exc:
+            raise ValueError(
+                "Invalid TarKG selector type. Use True, False, a string, an "
+                "enum value, or a list of strings/enum values. Example: "
+                "entities=[TarKGEntity.GENE], relations=[TarKGRelation.EDGES]."
+            ) from exc
+
+    def _file_aliases(self, file: TarKGFile) -> set[str]:
+        """Return normalized selector aliases for one manifest entry.
+
+        Args:
+            file: Manifest entry.
+
+        Returns:
+            A set of normalized aliases for the file.
+        """
+
+        return {
+            self._normalize(file.name),
+            self._normalize(file.stem),
+            self._normalize(file.stem.removesuffix("_nodes")),
+            self._normalize(file.stem.removesuffix("_feature")),
+            self._normalize(file.stem.removeprefix("TarKG_")),
+        }
+
     def _matches_selector(self, file: TarKGFile, selector: Selector) -> bool:
         """Return whether a manifest file matches a selector.
 
@@ -948,16 +1587,8 @@ class TarKGLoader:
         if selector is False or selector is None:
             return False
 
-        selected = [selector] if isinstance(selector, str) else selector
-        wanted = {self._normalize(item) for item in selected}
-        aliases = {
-            self._normalize(file.name),
-            self._normalize(file.stem),
-            self._normalize(file.stem.removesuffix("_nodes")),
-            self._normalize(file.stem.removesuffix("_feature")),
-            self._normalize(file.stem.removeprefix("TarKG_")),
-        }
-        return bool(wanted & aliases)
+        wanted = {self._normalize(item) for item in self._selector_items(selector)}
+        return bool(wanted & self._file_aliases(file))
 
     def _normalize(self, value: object) -> str:
         """Normalize selector values before matching.
@@ -1088,6 +1719,7 @@ def download_tarkg(
 def load_tarkg(
     *,
     cache_dir: str | os.PathLike[str] = DEFAULT_CACHE_DIR,
+    parquet_cache_dir: str | os.PathLike[str] | None = None,
     download: bool = True,
     max_workers: int = 4,
     kg: Selector = True,
@@ -1097,12 +1729,19 @@ def load_tarkg(
     verify_ssl: bool = False,
     show_progress: bool = True,
     verify_hashes: bool = True,
+    lazy: bool = False,
+    use_parquet_cache: bool = True,
     read_csv_kwargs: dict | None = None,
+    scan_csv_kwargs: dict | None = None,
+    read_parquet_kwargs: dict | None = None,
+    scan_parquet_kwargs: dict | None = None,
 ):
-    """Load selected TarKG CSV files as pandas DataFrames.
+    """Load selected TarKG CSV files with Polars.
 
     Args:
         cache_dir: Directory where downloaded files are cached.
+        parquet_cache_dir: Directory where CSV-to-parquet cache files are
+            stored. Defaults to ``cache_dir / "parquet"``.
         download: Whether to download missing files before loading.
         max_workers: Maximum number of files to download concurrently.
         kg: KG-level file selector.
@@ -1114,15 +1753,27 @@ def load_tarkg(
         show_progress: Whether to show progress bars or messages.
         verify_hashes: Whether to validate files against known hard-coded SHA256
             hashes after download or cache reuse.
+        lazy: Whether to return ``polars.LazyFrame`` objects instead of eager
+            ``polars.DataFrame`` objects.
+        use_parquet_cache: Whether to materialize and load parquet cache files
+            derived from the downloaded CSVs.
         read_csv_kwargs: Optional keyword arguments forwarded to
-            ``pandas.read_csv``.
+            ``polars.read_csv`` or ``polars.scan_csv`` during parquet
+            materialization.
+        scan_csv_kwargs: Optional keyword arguments forwarded to
+            ``polars.scan_csv`` when loading CSVs lazily.
+        read_parquet_kwargs: Optional keyword arguments forwarded to
+            ``polars.read_parquet``.
+        scan_parquet_kwargs: Optional keyword arguments forwarded to
+            ``polars.scan_parquet``.
 
     Returns:
-        A dictionary mapping CSV stems to pandas DataFrames.
+        A dictionary mapping CSV stems to Polars DataFrames or LazyFrames.
     """
 
     return TarKGLoader(
         cache_dir=cache_dir,
+        parquet_cache_dir=parquet_cache_dir,
         max_workers=max_workers,
         verify_ssl=verify_ssl,
         show_progress=show_progress,
@@ -1133,7 +1784,92 @@ def load_tarkg(
         entities=entities,
         relations=relations,
         features=features,
+        lazy=lazy,
+        use_parquet_cache=use_parquet_cache,
         read_csv_kwargs=read_csv_kwargs,
+        scan_csv_kwargs=scan_csv_kwargs,
+        read_parquet_kwargs=read_parquet_kwargs,
+        scan_parquet_kwargs=scan_parquet_kwargs,
+    )
+
+
+def materialize_parquet_cache(
+    *,
+    cache_dir: str | os.PathLike[str] = DEFAULT_CACHE_DIR,
+    parquet_cache_dir: str | os.PathLike[str] | None = None,
+    kg: Selector = True,
+    entities: Selector = True,
+    relations: Selector = True,
+    features: Selector = True,
+    force: bool = False,
+    read_csv_kwargs: dict | None = None,
+) -> dict[str, Path]:
+    """Convert selected cached TarKG CSV files to parquet cache files.
+
+    Args:
+        cache_dir: Directory where downloaded files are cached.
+        parquet_cache_dir: Directory where CSV-to-parquet cache files are
+            stored. Defaults to ``cache_dir / "parquet"``.
+        kg: KG-level file selector.
+        entities: Entity-information file selector.
+        relations: Relation/edge file selector.
+        features: Entity-feature file selector.
+        force: Whether to overwrite valid parquet cache files.
+        read_csv_kwargs: Optional keyword arguments forwarded to
+            ``polars.scan_csv`` before writing parquet.
+
+    Returns:
+        A dictionary mapping CSV stems to parquet cache paths.
+    """
+
+    return TarKGLoader(
+        cache_dir=cache_dir,
+        parquet_cache_dir=parquet_cache_dir,
+    ).materialize_parquet_cache(
+        kg=kg,
+        entities=entities,
+        relations=relations,
+        features=features,
+        force=force,
+        read_csv_kwargs=read_csv_kwargs,
+    )
+
+
+def parquet_paths(
+    *,
+    cache_dir: str | os.PathLike[str] = DEFAULT_CACHE_DIR,
+    parquet_cache_dir: str | os.PathLike[str] | None = None,
+    kg: Selector = True,
+    entities: Selector = True,
+    relations: Selector = True,
+    features: Selector = True,
+    only_existing: bool = True,
+) -> dict[str, Path]:
+    """Return parquet cache paths for selected TarKG CSV files.
+
+    Args:
+        cache_dir: Directory where downloaded files are cached.
+        parquet_cache_dir: Directory where CSV-to-parquet cache files are
+            stored. Defaults to ``cache_dir / "parquet"``.
+        kg: KG-level file selector.
+        entities: Entity-information file selector.
+        relations: Relation/edge file selector.
+        features: Entity-feature file selector.
+        only_existing: Whether to omit parquet files not currently cached.
+
+    Returns:
+        A dictionary mapping CSV stems to parquet cache paths.
+    """
+
+    return TarKGLoader(
+        cache_dir=cache_dir,
+        parquet_cache_dir=parquet_cache_dir,
+    ).parquet_paths(
+        kg=kg,
+        entities=entities,
+        relations=relations,
+        features=features,
+        only_existing=only_existing,
     )
 
 
