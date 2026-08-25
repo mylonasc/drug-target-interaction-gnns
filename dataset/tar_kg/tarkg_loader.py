@@ -8,7 +8,17 @@ skips files that are already present unless ``force=True`` is used.
 
 The core KG files are ``TarKG_nodes.csv`` and ``TarKG_edges.csv``. The
 ``*_mapping.csv`` files map TarKG node and edge records back to the original
-source knowledge graphs and source identifiers they were integrated from.
+source knowledge graphs and source identifiers they were integrated from:
+
+* ``TarKG_nodes_mapping.csv`` contains the TarKG node ``index``/``unify_id``,
+  entity ``kind`` and ``name``, source IDs (``kgid``, ``dbid``), source labels
+  (``db_source``, ``source``), and source-KG provenance (``kg_index``, ``kg``).
+* ``TarKG_edges_mapping.csv`` contains the TarKG edge ``index``, original
+  source head/tail IDs and types (``node1``, ``node1_type``, ``node2``,
+  ``node2_type``), original ``relation``, source ``db_source``, source-KG
+  provenance (``kg_index``, ``kg``), and ``change``. ``change=1`` means the
+  original triple order was swapped; ``change=0`` means it was unchanged.
+
 Entity-information files, such as ``Gene_nodes.csv``, contain detailed records
 for one entity type. Feature files, such as ``Gene_feature.csv``, contain model
 features for supported entity types.
@@ -305,10 +315,15 @@ class TarKGLoader:
     certificate validation is disabled by default because the TarKG host
     currently serves an expired TLS certificate.
 
-    Mapping files clarify provenance: ``TarKG_nodes_mapping.csv`` maps TarKG
-    nodes to their original source-KG identifiers, while
-    ``TarKG_edges_mapping.csv`` maps TarKG edges to the original source-KG edge
-    records they refer to.
+    Mapping files clarify provenance. ``TarKG_nodes_mapping.csv`` maps unified
+    TarKG nodes to source identifiers and source-KG records using columns such
+    as ``index``, ``unify_id``, ``kind``, ``kgid``, ``dbid``, ``db_source``,
+    ``name``, ``source``, ``kg_index``, and ``kg``. ``TarKG_edges_mapping.csv``
+    maps unified TarKG edges to source edge records using columns such as
+    ``index``, source ``node1``/``node2`` IDs and types, original ``relation``,
+    ``db_source``, ``kg_index``, ``kg``, and ``change``. ``change=1`` means the
+    original source triple head/tail order was swapped during unification;
+    ``change=0`` means it was unchanged.
 
     Example:
         Load only gene entity information plus the unique edge table as lazy
@@ -398,13 +413,17 @@ class TarKGLoader:
 
         Args:
             kg: KG-level file selector. ``True`` selects all KG-level files,
-                ``False`` selects none, and strings or iterables select by file
-                name, stem, or prefix.
+                including ``TarKG_nodes_mapping.csv``. ``False`` selects none,
+                and strings or iterables select by file name, stem, or prefix.
+                Shorthand selectors such as ``"nodes"`` also include their
+                mapping files; use exact filenames to select only one file.
             entities: Entity-information file selector. Examples include
                 ``TarKGEntity.GENE``, ``"Gene"``, or
                 ``[TarKGEntity.COMPOUND, TarKGEntity.DISEASE]``.
             relations: Relation/edge file selector. Examples include
                 ``TarKGRelation.EDGES``, ``"edges"``, or ``"edges_mapping"``.
+                Shorthand selectors such as ``"edges"`` also include their
+                mapping files; use exact filenames to select only one file.
             features: Entity-feature file selector. Examples include
                 ``TarKGEntity.DRUG``, ``"Drug"``, or ``["Gene_feature.csv"]``.
 
@@ -1736,13 +1755,22 @@ class TarKGLoader:
             A set of normalized aliases for the file.
         """
 
-        return {
+        aliases = {
             self._normalize(file.name),
             self._normalize(file.stem),
             self._normalize(file.stem.removesuffix("_nodes")),
             self._normalize(file.stem.removesuffix("_feature")),
             self._normalize(file.stem.removeprefix("TarKG_")),
         }
+
+        if file.name in {"TarKG_nodes_mapping.csv", "TarKG_edges_mapping.csv"}:
+            aliases.add(
+                self._normalize(
+                    file.stem.removesuffix("_mapping").removeprefix("TarKG_")
+                )
+            )
+
+        return aliases
 
     def _matches_selector(self, file: TarKGFile, selector: Selector) -> bool:
         """Return whether a manifest file matches a selector.
